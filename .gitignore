@@ -1,0 +1,54 @@
+# Node modules
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Credentials and secrets
+*.json
+!package.json
+credentials/
+secrets/
+.env
+.env.*
+
+# OAuth tokens
+oauth-tokens.txt
+tokens/
+*.token
+
+# Session files
+.pi/
+sessions/
+*.session
+
+# Build outputs
+dist/
+build/
+*.js
+*.js.map
+!test-example.ts
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Pi-specific
+.pi-cache/
+.pi-temp/
