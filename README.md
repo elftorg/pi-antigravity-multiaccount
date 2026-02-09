@@ -4,6 +4,12 @@ A TypeScript extension for [pi-coding-agent](https://github.com/badlogic/pi-mono
 
 ## Features
 
+### v1.3.0 Features (NEW)
+- **OAuth Browser Authentication** - Full OAuth 2.0 flow with browser-based login (no manual tokens needed)
+- **PKCE Support** - Secure authorization code flow with Proof Key for Code Exchange
+- **Auto Browser Launch** - Automatically opens browser for authentication
+- **Local Callback Server** - Listens on port 51121 for OAuth callback
+
 ### Core Features
 - **Multi-Account Storage** - Store multiple Google OAuth credentials in secure file  
 - **Interactive Setup** - Configure accounts via `/rotationsetup` command  
@@ -12,7 +18,7 @@ A TypeScript extension for [pi-coding-agent](https://github.com/badlogic/pi-mono
 - **Session Persistence** - State survives restarts and works across branches  
 - **Custom Rendering** - Beautiful TUI display for rotation events  
 
-### v1.2.0 Features (NEW)
+### v1.2.x Features
 - **Rate Limit Wait Logic** - Wait before rotating to preserve prompt cache
 - **Soft Quota Threshold** - Skip accounts with high failure rates
 - **Exponential Backoff** - Smart wait time calculation (5s, 10s, 20s...)

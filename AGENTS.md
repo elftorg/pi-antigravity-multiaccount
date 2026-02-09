@@ -4,7 +4,7 @@
 
 This is a TypeScript extension for [pi-coding-agent](https://github.com/badlogic/pi-mono) that implements automatic Google OAuth account rotation for the `google-antigravity` provider to bypass rate limits.
 
-**Current Version:** 1.2.0
+**Current Version:** 1.3.0
 
 ---
 
@@ -108,7 +108,22 @@ This extension uses the pi Extension API:
 
 ## Version History
 
-### v1.2.0 (Current)
+### v1.3.0 (Current)
+- **OAuth Browser Authentication**: Full OAuth 2.0 flow with browser-based login (no manual tokens needed)
+- **PKCE Support**: Secure authorization code flow with Proof Key for Code Exchange
+- **Hardcoded Antigravity Credentials**: Uses the same OAuth client as opencode-antigravity-auth
+- **Auto Browser Launch**: Automatically opens browser for authentication
+- **Local Callback Server**: Listens on port 51121 for OAuth callback
+- **Manual Fallback**: Option to paste callback URL if server fails
+
+### v1.2.1
+- Bug fixes and optimizations
+- Fixed `recordSuccess()` not being called on successful rotation
+- Added `MAX_ROTATION_DEPTH = 5` to prevent infinite recursion
+- Implemented `cleanupExpiredFailures()` for TTL-based failure reset
+- Optimized `getEnabledAccounts()` with caching
+
+### v1.2.0
 - **Rate Limit Wait Logic**: Wait before rotating to preserve prompt cache
 - **Soft Quota Threshold**: Skip accounts that have high failure rates
 - **Exponential Backoff**: Smart wait time calculation (5s, 10s, 20s...)

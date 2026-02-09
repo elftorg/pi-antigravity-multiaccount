@@ -20,7 +20,7 @@
  * - Soft quota threshold
  * - Health scoring system
  * 
- * @version 1.2.1
+ * @version 1.3.0
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -157,14 +157,22 @@ function calculateWaitTime(failureCount: number, config: RotationConfig): number
 
 /**
  * OAuth configuration for Google Antigravity
+ * Credentials from opencode-antigravity-auth (public OAuth client)
  */
-const GOOGLE_OAUTH_CONFIG = {
+const ANTIGRAVITY_OAUTH_CONFIG = {
 	authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
 	tokenUrl: "https://oauth2.googleapis.com/token",
-	clientId: process.env.GOOGLE_CLIENT_ID || "",
-	clientSecret: process.env.GOOGLE_CLIENT_SECRET || "",
-	redirectUri: "http://localhost:8888/callback",
-	scope: "https://www.googleapis.com/auth/generative-language.retriever",
+	clientId: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+	clientSecret: "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",
+	redirectUri: "http://localhost:51121/oauth-callback",
+	port: 51121,
+	scopes: [
+		"https://www.googleapis.com/auth/cloud-platform",
+		"https://www.googleapis.com/auth/userinfo.email",
+		"https://www.googleapis.com/auth/userinfo.profile",
+		"https://www.googleapis.com/auth/cclog",
+		"https://www.googleapis.com/auth/experimentsandconfigs",
+	],
 };
 
 // ============================================================================
@@ -254,40 +262,67 @@ function loadCredentials(): AccountCredentials[] {
 }
 
 /**
- * Generate OAuth authorization URL
+ * Generate PKCE code verifier (random string)
  */
-function generateAuthUrl(state: string): string {
-	const params = new URLSearchParams({
-		client_id: GOOGLE_OAUTH_CONFIG.clientId,
-		redirect_uri: GOOGLE_OAUTH_CONFIG.redirectUri,
-		response_type: "code",
-		scope: GOOGLE_OAUTH_CONFIG.scope,
-		access_type: "offline",
-		prompt: "consent",
-		state,
-	});
-
-	return `${GOOGLE_OAUTH_CONFIG.authUrl}?${params.toString()}`;
+function generateCodeVerifier(): string {
+	const array = new Uint8Array(32);
+	crypto.getRandomValues(array);
+	return Array.from(array, byte => byte.toString(16).padStart(2, "0")).join("");
 }
 
 /**
- * Exchange authorization code for tokens
+ * Generate PKCE code challenge from verifier (SHA-256 hash, base64url encoded)
  */
-async function exchangeCodeForTokens(code: string): Promise<OAuthCredentials> {
+async function generateCodeChallenge(verifier: string): Promise<string> {
+	const encoder = new TextEncoder();
+	const data = encoder.encode(verifier);
+	const hash = await crypto.subtle.digest("SHA-256", data);
+	const base64 = btoa(String.fromCharCode(...new Uint8Array(hash)));
+	// Convert to base64url
+	return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/**
+ * Generate OAuth authorization URL with PKCE
+ */
+function generateAuthUrl(state: string, codeChallenge: string): string {
 	const params = new URLSearchParams({
-		code,
-		client_id: GOOGLE_OAUTH_CONFIG.clientId,
-		client_secret: GOOGLE_OAUTH_CONFIG.clientSecret,
-		redirect_uri: GOOGLE_OAUTH_CONFIG.redirectUri,
-		grant_type: "authorization_code",
+		client_id: ANTIGRAVITY_OAUTH_CONFIG.clientId,
+		redirect_uri: ANTIGRAVITY_OAUTH_CONFIG.redirectUri,
+		response_type: "code",
+		scope: ANTIGRAVITY_OAUTH_CONFIG.scopes.join(" "),
+		access_type: "offline",
+		prompt: "consent",
+		state,
+		code_challenge: codeChallenge,
+		code_challenge_method: "S256",
 	});
 
-	const response = await fetch(GOOGLE_OAUTH_CONFIG.tokenUrl, {
+	return `${ANTIGRAVITY_OAUTH_CONFIG.authUrl}?${params.toString()}`;
+}
+
+/**
+ * Exchange authorization code for tokens (with PKCE support)
+ */
+async function exchangeCodeForTokens(code: string, codeVerifier?: string): Promise<OAuthCredentials> {
+	const params: Record<string, string> = {
+		code,
+		client_id: ANTIGRAVITY_OAUTH_CONFIG.clientId,
+		client_secret: ANTIGRAVITY_OAUTH_CONFIG.clientSecret,
+		redirect_uri: ANTIGRAVITY_OAUTH_CONFIG.redirectUri,
+		grant_type: "authorization_code",
+	};
+	
+	if (codeVerifier) {
+		params.code_verifier = codeVerifier;
+	}
+
+	const response = await fetch(ANTIGRAVITY_OAUTH_CONFIG.tokenUrl, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
 		},
-		body: params.toString(),
+		body: new URLSearchParams(params).toString(),
 	});
 
 	if (!response.ok) {
@@ -310,12 +345,12 @@ async function exchangeCodeForTokens(code: string): Promise<OAuthCredentials> {
 async function refreshOAuthToken(refreshToken: string): Promise<OAuthCredentials> {
 	const params = new URLSearchParams({
 		refresh_token: refreshToken,
-		client_id: GOOGLE_OAUTH_CONFIG.clientId,
-		client_secret: GOOGLE_OAUTH_CONFIG.clientSecret,
+		client_id: ANTIGRAVITY_OAUTH_CONFIG.clientId,
+		client_secret: ANTIGRAVITY_OAUTH_CONFIG.clientSecret,
 		grant_type: "refresh_token",
 	});
 
-	const response = await fetch(GOOGLE_OAUTH_CONFIG.tokenUrl, {
+	const response = await fetch(ANTIGRAVITY_OAUTH_CONFIG.tokenUrl, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -346,14 +381,14 @@ async function startOAuthServer(): Promise<{ code: string; state: string }> {
 		const server = http.createServer((req: any, res: any) => {
 			const url = new URL(req.url, `http://${req.headers.host}`);
 
-			if (url.pathname === "/callback") {
+			if (url.pathname === "/oauth-callback") {
 				const code = url.searchParams.get("code");
 				const state = url.searchParams.get("state");
 				const error = url.searchParams.get("error");
 
 				if (error) {
 					res.writeHead(400, { "Content-Type": "text/html" });
-					res.end(`<html><body><h1>Authentication Failed</h1><p>${error}</p></body></html>`);
+					res.end(`<html><body style="font-family: sans-serif; text-align: center; padding: 50px;"><h1>Authentication Failed</h1><p style="color: red;">${error}</p><p>You can close this window.</p></body></html>`);
 					server.close();
 					reject(new Error(`OAuth error: ${error}`));
 					return;
@@ -362,7 +397,7 @@ async function startOAuthServer(): Promise<{ code: string; state: string }> {
 				if (code && state) {
 					res.writeHead(200, { "Content-Type": "text/html" });
 					res.end(
-						`<html><body><h1>Authentication Successful!</h1><p>You can close this window and return to pi.</p></body></html>`
+						`<html><body style="font-family: sans-serif; text-align: center; padding: 50px;"><h1 style="color: green;">Authentication Successful!</h1><p>You can close this window and return to pi.</p></body></html>`
 					);
 					server.close();
 					resolve({ code, state });
@@ -370,18 +405,29 @@ async function startOAuthServer(): Promise<{ code: string; state: string }> {
 				}
 
 				res.writeHead(400, { "Content-Type": "text/html" });
-				res.end(`<html><body><h1>Invalid Request</h1></body></html>`);
+				res.end(`<html><body style="font-family: sans-serif; text-align: center; padding: 50px;"><h1>Invalid Request</h1><p>Missing code or state parameter.</p></body></html>`);
+			} else {
+				res.writeHead(404, { "Content-Type": "text/html" });
+				res.end(`<html><body style="font-family: sans-serif; text-align: center; padding: 50px;"><h1>Not Found</h1><p>Waiting for OAuth callback at /oauth-callback</p></body></html>`);
 			}
 		});
 
-		server.listen(8888, () => {
-			console.log("OAuth callback server started on http://localhost:8888");
+		server.listen(ANTIGRAVITY_OAUTH_CONFIG.port, () => {
+			debug(`OAuth callback server started on http://localhost:${ANTIGRAVITY_OAUTH_CONFIG.port}`);
+		});
+
+		server.on("error", (err: any) => {
+			if (err.code === "EADDRINUSE") {
+				reject(new Error(`Port ${ANTIGRAVITY_OAUTH_CONFIG.port} is already in use. Please close other applications using this port.`));
+			} else {
+				reject(new Error(`Server error: ${err.message}`));
+			}
 		});
 
 		// Timeout after 5 minutes
 		setTimeout(() => {
 			server.close();
-			reject(new Error("OAuth timeout - no response received"));
+			reject(new Error("OAuth timeout - no response received within 5 minutes"));
 		}, 5 * 60 * 1000);
 	});
 }
@@ -1332,9 +1378,8 @@ export default function (pi: ExtensionAPI) {
 				// If "Add more accounts", continue below
 			}
 
-			// Check if OAuth is configured
-			const hasOAuthConfig =
-				GOOGLE_OAUTH_CONFIG.clientId && GOOGLE_OAUTH_CONFIG.clientSecret;
+			// Antigravity OAuth is always available (hardcoded credentials)
+			const hasOAuthConfig = true;
 
 			// Collect accounts
 			let addingAccounts = true;
@@ -1342,10 +1387,7 @@ export default function (pi: ExtensionAPI) {
 
 			while (addingAccounts) {
 				// Ask for method
-				const methods = ["Manual Token Input", "OAuth 2.0 Flow (Browser)"];
-				if (!hasOAuthConfig) {
-					methods[1] += " (Not configured - set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)";
-				}
+				const methods = ["OAuth 2.0 Flow (Browser) - Recommended", "Manual Token Input"];
 
 				const method = await ctx.ui.select(
 					`Add Account (${newAccounts.length + 1}) - Choose Method:`,
@@ -1361,31 +1403,42 @@ export default function (pi: ExtensionAPI) {
 					continue;
 				}
 
-				if (method.includes("OAuth") && hasOAuthConfig) {
-					// OAuth flow
+				if (method.includes("OAuth")) {
+					// OAuth flow with PKCE
 					try {
-						debug("Starting OAuth flow");
-						ctx.ui.notify("Starting OAuth flow...", "info");
+						debug("Starting OAuth flow with PKCE");
+						ctx.ui.notify("Starting Google Antigravity OAuth flow...", "info");
 
+						// Generate PKCE code verifier and challenge
+						const codeVerifier = generateCodeVerifier();
+						const codeChallenge = await generateCodeChallenge(codeVerifier);
 						const stateParam = generateAccountId();
-						const authUrl = generateAuthUrl(stateParam);
+						const authUrl = generateAuthUrl(stateParam, codeChallenge);
 
-						ctx.ui.notify(`Opening browser for authentication...\n${authUrl}`, "info");
-						ctx.ui.notify("Waiting for OAuth callback on http://localhost:8888...", "info");
+						// Try to open browser
+						const open = require("node:child_process");
+						try {
+							if (process.platform === "win32") {
+								open.exec(`start "" "${authUrl}"`);
+							} else if (process.platform === "darwin") {
+								open.exec(`open "${authUrl}"`);
+							} else {
+								open.exec(`xdg-open "${authUrl}"`);
+							}
+							ctx.ui.notify("Browser opened for authentication", "info");
+						} catch {
+							ctx.ui.notify("Could not open browser automatically", "warning");
+						}
+
+						ctx.ui.notify(`Waiting for OAuth callback on http://localhost:${ANTIGRAVITY_OAUTH_CONFIG.port}...`, "info");
+						ctx.ui.notify(`If browser didn't open, visit:\n${authUrl}`, "info");
 
 						// Start local server and wait for callback
 						const serverPromise = startOAuthServer();
 
-						// Give user option to manually enter callback URL
-						const manualInput = await ctx.ui.confirm(
-							"Browser Authentication",
-							`Browser should open automatically. If not, visit:\n${authUrl}\n\nWaiting for callback...`,
-							{ timeout: 10000 }
-						);
-
 						let credentials: OAuthCredentials;
 
-						if (!manualInput) {
+						try {
 							// Wait for server callback
 							const { code, state: returnedState } = await serverPromise;
 
@@ -1395,13 +1448,15 @@ export default function (pi: ExtensionAPI) {
 
 							// Exchange code for tokens
 							ctx.ui.notify("Exchanging code for tokens...", "info");
-							credentials = await exchangeCodeForTokens(code);
+							credentials = await exchangeCodeForTokens(code, codeVerifier);
 							debug("OAuth tokens obtained successfully");
-						} else {
-							// Manual fallback
+						} catch (serverError) {
+							// If server failed, offer manual input
+							ctx.ui.notify(`Server error: ${serverError}. Try manual input.`, "warning");
+							
 							const callbackUrl = await ctx.ui.input(
 								"Manual Callback",
-								"Paste the callback URL from your browser"
+								"Paste the full callback URL from your browser (starts with http://localhost:51121/oauth-callback?code=...)"
 							);
 
 							if (!callbackUrl) {
@@ -1416,7 +1471,7 @@ export default function (pi: ExtensionAPI) {
 								throw new Error("No authorization code in callback URL");
 							}
 
-							credentials = await exchangeCodeForTokens(code);
+							credentials = await exchangeCodeForTokens(code, codeVerifier);
 						}
 
 						// Ask for optional label
