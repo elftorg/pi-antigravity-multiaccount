@@ -1,21 +1,25 @@
 {
   "name": "pi-extension-antigravity-rotation",
-  "version": "1.0.0",
-  "description": "Automatic account rotation for google-antigravity provider in pi-coding-agent",
+  "version": "1.2.0",
+  "description": "Automatic account rotation for google-antigravity provider in pi-coding-agent with multiple selection strategies, health scoring, and smart rate limit handling",
   "type": "module",
   "keywords": [
     "pi-coding-agent",
     "extension",
     "google-antigravity",
     "rate-limit",
-    "account-rotation"
+    "account-rotation",
+    "multi-account",
+    "quota-management"
   ],
   "pi": {
-    "extensions": ["./account-rotation.ts"]
+    "extensions": [
+      "./account-rotation.ts"
+    ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": ">=0.52.0",
     "@mariozechner/pi-ai": ">=0.52.0",
+    "@mariozechner/pi-coding-agent": ">=0.52.0",
     "@mariozechner/pi-tui": ">=0.52.0",
     "@sinclair/typebox": "*"
   },
@@ -28,5 +32,8 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/yourusername/pi-antigravity-multiaccount.git"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

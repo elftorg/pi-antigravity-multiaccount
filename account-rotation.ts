@@ -12,6 +12,15 @@
  * - State reconstruction from session entries across branches
  * - Secure credential storage in ~/.pi/agent/rotation-credentials.json
  * - Custom rendering for rotation events
+ * - Configuration file support (~/.pi/agent/rotation-config.json)
+ * - Multiple selection strategies (sticky, round-robin, hybrid)
+ * - Account enable/disable
+ * - Debug logging
+ * - Rate limit wait logic (wait before rotating to preserve cache)
+ * - Soft quota threshold
+ * - Health scoring system
+ * 
+ * @version 1.2.0
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -28,31 +37,120 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 
+// ============================================================================
+// TYPES & INTERFACES
+// ============================================================================
+
+type SelectionStrategy = "sticky" | "round-robin" | "hybrid";
+
+interface RotationConfig {
+	// Selection strategy
+	account_selection_strategy: SelectionStrategy;
+	pid_offset_enabled: boolean;
+	
+	// Rate limiting
+	max_rate_limit_wait_seconds: number;
+	failure_ttl_seconds: number;
+	rate_limit_wait_enabled: boolean;
+	rate_limit_initial_wait_seconds: number;
+	
+	// Quota management
+	soft_quota_threshold_percent: number;
+	
+	// Behavior
+	debug: boolean;
+	quiet_mode: boolean;
+}
+
 interface AccountCredentials extends OAuthCredentials {
 	id: string; // Unique account ID
 	label?: string; // Optional user-friendly label
 	addedAt: number; // Timestamp when added
+	enabled: boolean; // Whether account is enabled for rotation
+}
+
+interface AccountQuotaState {
+	lastRateLimitAt?: number;
+	rateLimitUntil?: number;
+	requestCount: number;
+	failureCount: number;
+	lastSuccessAt?: number;
 }
 
 interface AccountRotationState {
 	accounts: AccountCredentials[];
 	currentIndex: number;
 	rotationCount: number;
+	quotaState: Record<string, AccountQuotaState>;
 }
 
 interface RotationDetails {
-	action: "setup" | "rotate" | "status" | "oauth";
+	action: "setup" | "rotate" | "status" | "oauth" | "enable" | "disable" | "config";
 	state: AccountRotationState;
 	message: string;
 	error?: string;
 }
 
 const RotateAccountParams = Type.Object({
-	action: StringEnum(["rotate", "status"] as const),
+	action: StringEnum(["rotate", "status", "enable", "disable", "health", "reset"] as const),
+	accountId: Type.Optional(Type.String({ description: "Account ID for enable/disable actions" })),
 });
 
-// Path to credentials file
-const CREDENTIALS_FILE = join(homedir(), ".pi", "agent", "rotation-credentials.json");
+// ============================================================================
+// CONSTANTS & DEFAULTS
+// ============================================================================
+
+const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+const CREDENTIALS_FILE = join(PI_AGENT_DIR, "rotation-credentials.json");
+const CONFIG_FILE = join(PI_AGENT_DIR, "rotation-config.json");
+
+const DEFAULT_CONFIG: RotationConfig = {
+	account_selection_strategy: "hybrid",
+	pid_offset_enabled: false,
+	max_rate_limit_wait_seconds: 60,
+	failure_ttl_seconds: 3600,
+	rate_limit_wait_enabled: true,
+	rate_limit_initial_wait_seconds: 5,
+	soft_quota_threshold_percent: 90,
+	debug: false,
+	quiet_mode: false,
+};
+
+// ============================================================================
+// LOGGING
+// ============================================================================
+
+let debugEnabled = false;
+
+function debug(msg: string, ...args: any[]): void {
+	if (debugEnabled || process.env.PI_ROTATION_DEBUG) {
+		const timestamp = new Date().toISOString().slice(11, 23);
+		console.log(`[rotation ${timestamp}] ${msg}`, ...args);
+	}
+}
+
+function debugState(label: string, state: any): void {
+	if (debugEnabled || process.env.PI_ROTATION_DEBUG) {
+		debug(`${label}:`, JSON.stringify(state, null, 2));
+	}
+}
+
+/**
+ * Sleep for specified milliseconds
+ */
+function sleep(ms: number): Promise<void> {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Calculate wait time based on failure count (exponential backoff)
+ */
+function calculateWaitTime(failureCount: number, config: RotationConfig): number {
+	const baseWait = config.rate_limit_initial_wait_seconds;
+	// Exponential backoff: 5, 10, 20, 40... capped at max
+	const waitTime = baseWait * Math.pow(2, Math.min(failureCount, 4));
+	return Math.min(waitTime, config.max_rate_limit_wait_seconds);
+}
 
 /**
  * OAuth configuration for Google Antigravity
@@ -66,6 +164,50 @@ const GOOGLE_OAUTH_CONFIG = {
 	scope: "https://www.googleapis.com/auth/generative-language.retriever",
 };
 
+// ============================================================================
+// CONFIG MANAGEMENT
+// ============================================================================
+
+/**
+ * Load configuration from file, with defaults
+ */
+function loadConfig(): RotationConfig {
+	try {
+		if (!existsSync(CONFIG_FILE)) {
+			debug("Config file not found, using defaults");
+			return { ...DEFAULT_CONFIG };
+		}
+		const data = readFileSync(CONFIG_FILE, "utf-8");
+		const parsed = JSON.parse(data);
+		const config = { ...DEFAULT_CONFIG, ...parsed };
+		debug("Loaded config:", config);
+		return config;
+	} catch (error) {
+		console.error("Failed to load config:", error);
+		return { ...DEFAULT_CONFIG };
+	}
+}
+
+/**
+ * Save configuration to file
+ */
+function saveConfig(config: RotationConfig): void {
+	try {
+		const dir = dirname(CONFIG_FILE);
+		if (!existsSync(dir)) {
+			mkdirSync(dir, { recursive: true });
+		}
+		writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { mode: 0o600 });
+		debug("Saved config to", CONFIG_FILE);
+	} catch (error) {
+		console.error("Failed to save config:", error);
+	}
+}
+
+// ============================================================================
+// CREDENTIALS MANAGEMENT
+// ============================================================================
+
 /**
  * Save credentials to secure file
  */
@@ -76,6 +218,7 @@ function saveCredentials(accounts: AccountCredentials[]): void {
 			mkdirSync(dir, { recursive: true });
 		}
 		writeFileSync(CREDENTIALS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
+		debug(`Saved ${accounts.length} account(s) to credentials file`);
 	} catch (error) {
 		console.error("Failed to save credentials:", error);
 	}
@@ -87,10 +230,18 @@ function saveCredentials(accounts: AccountCredentials[]): void {
 function loadCredentials(): AccountCredentials[] {
 	try {
 		if (!existsSync(CREDENTIALS_FILE)) {
+			debug("Credentials file not found");
 			return [];
 		}
 		const data = readFileSync(CREDENTIALS_FILE, "utf-8");
-		return JSON.parse(data);
+		const accounts = JSON.parse(data);
+		// Migrate old accounts without 'enabled' field
+		const migrated = accounts.map((acc: any) => ({
+			...acc,
+			enabled: acc.enabled !== undefined ? acc.enabled : true,
+		}));
+		debug(`Loaded ${migrated.length} account(s) from credentials file`);
+		return migrated;
 	} catch (error) {
 		console.error("Failed to load credentials:", error);
 		return [];
@@ -238,14 +389,21 @@ function isRateLimitError(error: any): boolean {
 
 	const errorStr = typeof error === "string" ? error : JSON.stringify(error).toLowerCase();
 
-	return (
+	const isRateLimit = (
 		errorStr.includes("429") ||
 		errorStr.includes("rate limit") ||
 		errorStr.includes("quota exceeded") ||
 		errorStr.includes("resource_exhausted") ||
 		(errorStr.includes("404") && errorStr.includes("not found")) ||
-		errorStr.includes("too many requests")
+		errorStr.includes("too many requests") ||
+		errorStr.includes("rate_limit_exceeded")
 	);
+
+	if (isRateLimit) {
+		debug("Detected rate limit error:", errorStr.slice(0, 200));
+	}
+
+	return isRateLimit;
 }
 
 /**
@@ -297,12 +455,212 @@ function generateAccountId(): string {
 	return `acc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// ============================================================================
+// SELECTION STRATEGIES & HEALTH SCORING
+// ============================================================================
+
+/**
+ * Get enabled accounts only
+ */
+function getEnabledAccounts(accounts: AccountCredentials[]): AccountCredentials[] {
+	return accounts.filter(acc => acc.enabled);
+}
+
+/**
+ * Check if account has reached soft quota threshold
+ * Based on failure patterns and recent rate limits
+ */
+function hasReachedSoftQuota(
+	account: AccountCredentials,
+	quotaState: Record<string, AccountQuotaState>,
+	config: RotationConfig
+): boolean {
+	const quota = quotaState[account.id];
+	if (!quota) return false;
+	
+	// Check if currently rate limited
+	if (quota.rateLimitUntil && Date.now() < quota.rateLimitUntil) {
+		debug(`Account ${account.label || account.id} is currently rate limited`);
+		return true;
+	}
+	
+	// Check failure rate if we have enough requests
+	if (quota.requestCount >= 10) {
+		const failureRate = (quota.failureCount / quota.requestCount) * 100;
+		if (failureRate >= config.soft_quota_threshold_percent) {
+			debug(`Account ${account.label || account.id} has high failure rate: ${failureRate.toFixed(1)}%`);
+			return true;
+		}
+	}
+	
+	return false;
+}
+
+/**
+ * Calculate health score for an account (0-100)
+ */
+function calculateHealthScore(
+	account: AccountCredentials, 
+	quotaState: Record<string, AccountQuotaState>,
+	config: RotationConfig
+): number {
+	const quota = quotaState[account.id];
+	if (!quota) return 100;
+	
+	let score = 100;
+	const now = Date.now();
+	
+	// Check if currently rate limited
+	if (quota.rateLimitUntil && now < quota.rateLimitUntil) {
+		score -= 80; // Heavily penalize active rate limits
+	}
+	
+	// Penalize recent rate limits (within last hour)
+	if (quota.lastRateLimitAt && now - quota.lastRateLimitAt < 3600000) {
+		const minutesAgo = (now - quota.lastRateLimitAt) / 60000;
+		score -= Math.max(0, 30 - minutesAgo * 0.5); // Decrease penalty over time
+	}
+	
+	// Penalize failures (reset after TTL)
+	if (quota.failureCount > 0) {
+		const lastFailure = quota.lastRateLimitAt || 0;
+		if (now - lastFailure < config.failure_ttl_seconds * 1000) {
+			score -= Math.min(50, quota.failureCount * 10);
+		}
+	}
+	
+	// Reward recent success
+	if (quota.lastSuccessAt && now - quota.lastSuccessAt < 60000) {
+		score += 10;
+	}
+	
+	return Math.max(0, Math.min(100, score));
+}
+
+/**
+ * Select next account based on strategy
+ */
+function selectNextAccount(
+	accounts: AccountCredentials[],
+	currentIndex: number,
+	quotaState: Record<string, AccountQuotaState>,
+	config: RotationConfig,
+	forceRotate: boolean = false
+): number {
+	const enabledAccounts = getEnabledAccounts(accounts);
+	
+	if (enabledAccounts.length === 0) {
+		debug("No enabled accounts available");
+		return currentIndex;
+	}
+	
+	if (enabledAccounts.length === 1) {
+		const idx = accounts.findIndex(a => a.id === enabledAccounts[0].id);
+		debug("Only one enabled account, using index:", idx);
+		return idx;
+	}
+	
+	const strategy = config.account_selection_strategy;
+	debug(`Selecting account with strategy: ${strategy}, forceRotate: ${forceRotate}`);
+	
+	switch (strategy) {
+		case "sticky": {
+			// Stay on current account unless forced to rotate or it's disabled
+			const currentAccount = accounts[currentIndex];
+			if (!forceRotate && currentAccount?.enabled) {
+				debug("Sticky: staying on current account");
+				return currentIndex;
+			}
+			// Find next enabled account
+			for (let i = 1; i <= accounts.length; i++) {
+				const nextIdx = (currentIndex + i) % accounts.length;
+				if (accounts[nextIdx].enabled) {
+					debug("Sticky: rotating to next enabled account:", nextIdx);
+					return nextIdx;
+				}
+			}
+			return currentIndex;
+		}
+		
+		case "round-robin": {
+			// Always rotate to next enabled account
+			for (let i = 1; i <= accounts.length; i++) {
+				const nextIdx = (currentIndex + i) % accounts.length;
+				if (accounts[nextIdx].enabled) {
+					debug("Round-robin: rotating to account:", nextIdx);
+					return nextIdx;
+				}
+			}
+			return currentIndex;
+		}
+		
+		case "hybrid":
+		default: {
+			// Select based on health score, skip accounts at soft quota threshold
+			let bestIdx = currentIndex;
+			let bestScore = -1;
+			
+			for (let i = 0; i < accounts.length; i++) {
+				const acc = accounts[i];
+				if (!acc.enabled) continue;
+				
+				// Skip accounts that have reached soft quota threshold
+				if (hasReachedSoftQuota(acc, quotaState, config)) {
+					debug(`Skipping ${acc.label || acc.id} - at soft quota threshold`);
+					continue;
+				}
+				
+				const score = calculateHealthScore(acc, quotaState, config);
+				debug(`Health score for ${acc.label || acc.id}: ${score}`);
+				
+				// Prefer different account if current is rate limited
+				const isCurrent = i === currentIndex;
+				const adjustedScore = isCurrent && forceRotate ? score - 20 : score;
+				
+				if (adjustedScore > bestScore) {
+					bestScore = adjustedScore;
+					bestIdx = i;
+				}
+			}
+			
+			debug("Hybrid: selected account with score", bestScore, "at index", bestIdx);
+			return bestIdx;
+		}
+	}
+}
+
+/**
+ * Get initial account index (with PID offset support)
+ */
+function getInitialAccountIndex(accounts: AccountCredentials[], config: RotationConfig): number {
+	const enabledAccounts = getEnabledAccounts(accounts);
+	if (enabledAccounts.length === 0) return 0;
+	
+	if (config.pid_offset_enabled) {
+		const offset = process.pid % enabledAccounts.length;
+		const selectedAccount = enabledAccounts[offset];
+		const actualIdx = accounts.findIndex(a => a.id === selectedAccount.id);
+		debug(`PID offset enabled: pid=${process.pid}, offset=${offset}, actualIdx=${actualIdx}`);
+		return actualIdx;
+	}
+	
+	// Default to first enabled account
+	const firstEnabled = accounts.findIndex(a => a.enabled);
+	return firstEnabled >= 0 ? firstEnabled : 0;
+}
+
 export default function (pi: ExtensionAPI) {
+	// Load configuration
+	let config = loadConfig();
+	debugEnabled = config.debug;
+	debug("Extension starting with config:", config);
+
 	// In-memory state (reconstructed from session on load)
 	let state: AccountRotationState = {
 		accounts: [],
 		currentIndex: 0,
 		rotationCount: 0,
+		quotaState: {},
 	};
 
 	// Load credentials from file on startup
@@ -310,7 +668,11 @@ export default function (pi: ExtensionAPI) {
 		const accounts = loadCredentials();
 		if (accounts.length > 0) {
 			state.accounts = accounts;
-			console.log(`Loaded ${accounts.length} account(s) from credentials file`);
+			// Set initial index with PID offset if enabled
+			if (state.currentIndex === 0) {
+				state.currentIndex = getInitialAccountIndex(accounts, config);
+			}
+			debug(`Loaded ${accounts.length} account(s), current index: ${state.currentIndex}`);
 		}
 	};
 
@@ -318,6 +680,10 @@ export default function (pi: ExtensionAPI) {
 	 * Reconstruct state from session entries
 	 */
 	const reconstructState = (ctx: ExtensionContext) => {
+		// Reload config in case it changed
+		config = loadConfig();
+		debugEnabled = config.debug;
+
 		// First try to load from file
 		loadAccountsFromFile();
 
@@ -333,6 +699,8 @@ export default function (pi: ExtensionAPI) {
 					// Only update index and count, keep accounts from file
 					state.currentIndex = details.state.currentIndex;
 					state.rotationCount = details.state.rotationCount;
+					// Merge quota state
+					state.quotaState = { ...state.quotaState, ...details.state.quotaState };
 				}
 			}
 
@@ -348,26 +716,103 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 		}
+
+		debug("State reconstructed:", {
+			accountCount: state.accounts.length,
+			currentIndex: state.currentIndex,
+			rotationCount: state.rotationCount,
+		});
+	};
+
+	/**
+	 * Record rate limit for an account
+	 */
+	const recordRateLimit = (accountId: string) => {
+		const now = Date.now();
+		const existing = state.quotaState[accountId] || {
+			requestCount: 0,
+			failureCount: 0,
+		};
+		
+		state.quotaState[accountId] = {
+			...existing,
+			lastRateLimitAt: now,
+			rateLimitUntil: now + config.max_rate_limit_wait_seconds * 1000,
+			failureCount: existing.failureCount + 1,
+		};
+		
+		debug(`Recorded rate limit for ${accountId}:`, state.quotaState[accountId]);
+	};
+
+	/**
+	 * Record success for an account
+	 */
+	const recordSuccess = (accountId: string) => {
+		const existing = state.quotaState[accountId] || {
+			requestCount: 0,
+			failureCount: 0,
+		};
+		
+		state.quotaState[accountId] = {
+			...existing,
+			lastSuccessAt: Date.now(),
+			requestCount: existing.requestCount + 1,
+		};
 	};
 
 	/**
 	 * Switch to the next available account
 	 */
-	const rotateAccount = async (ctx: ExtensionContext): Promise<boolean> => {
-		if (state.accounts.length === 0) {
-			ctx.ui.notify("No accounts configured for rotation. Use /rotationsetup to add accounts.", "error");
+	const rotateAccount = async (ctx: ExtensionContext, forceRotate: boolean = true): Promise<boolean> => {
+		const enabledAccounts = getEnabledAccounts(state.accounts);
+		
+		if (enabledAccounts.length === 0) {
+			if (!config.quiet_mode) {
+				ctx.ui.notify("No enabled accounts for rotation. Use /rotationsetup to add accounts.", "error");
+			}
+			debug("No enabled accounts available");
 			return false;
 		}
 
-		if (state.accounts.length === 1) {
-			ctx.ui.notify("Only one account configured. Cannot rotate.", "warning");
-			return false;
+		if (enabledAccounts.length === 1 && forceRotate) {
+			const currentAccount = state.accounts[state.currentIndex];
+			if (currentAccount?.enabled) {
+				if (!config.quiet_mode) {
+					ctx.ui.notify("Only one enabled account. Cannot rotate.", "warning");
+				}
+				debug("Only one enabled account, cannot rotate");
+				return false;
+			}
 		}
 
-		// Move to next account
+		// Record rate limit for current account if force rotating
+		if (forceRotate && state.accounts[state.currentIndex]) {
+			recordRateLimit(state.accounts[state.currentIndex].id);
+		}
+
+		// Select next account using strategy
 		const previousIndex = state.currentIndex;
-		state.currentIndex = (state.currentIndex + 1) % state.accounts.length;
+		state.currentIndex = selectNextAccount(
+			state.accounts, 
+			state.currentIndex, 
+			state.quotaState, 
+			config,
+			forceRotate
+		);
+		
+		if (state.currentIndex === previousIndex && forceRotate && enabledAccounts.length > 1) {
+			// Force move to different account
+			for (let i = 1; i <= state.accounts.length; i++) {
+				const nextIdx = (previousIndex + i) % state.accounts.length;
+				if (state.accounts[nextIdx].enabled) {
+					state.currentIndex = nextIdx;
+					break;
+				}
+			}
+		}
+
 		state.rotationCount++;
+		debug(`Rotating from index ${previousIndex} to ${state.currentIndex}`);
 
 		const newCredentials = state.accounts[state.currentIndex];
 
@@ -376,7 +821,10 @@ export default function (pi: ExtensionAPI) {
 		if (credentials.expires && credentials.expires < Date.now() + 60000) {
 			// Token expires in less than 1 minute
 			try {
-				ctx.ui.notify("Refreshing expired token...", "info");
+				debug("Token expired, refreshing...");
+				if (!config.quiet_mode) {
+					ctx.ui.notify("Refreshing expired token...", "info");
+				}
 				credentials = await refreshOAuthToken(credentials.refresh);
 				// Update stored credentials
 				state.accounts[state.currentIndex] = {
@@ -384,11 +832,15 @@ export default function (pi: ExtensionAPI) {
 					...credentials,
 				};
 				saveCredentials(state.accounts);
+				debug("Token refreshed successfully");
 			} catch (error) {
-				ctx.ui.notify(`Failed to refresh token: ${error}`, "error");
-				// Try next account
-				state.currentIndex = (state.currentIndex + 1) % state.accounts.length;
-				return rotateAccount(ctx);
+				debug("Token refresh failed:", error);
+				if (!config.quiet_mode) {
+					ctx.ui.notify(`Failed to refresh token: ${error}`, "error");
+				}
+				// Record failure and try next account
+				recordRateLimit(newCredentials.id);
+				return rotateAccount(ctx, true);
 			}
 		}
 
@@ -411,14 +863,22 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			const label = newCredentials.label || `#${state.currentIndex + 1}`;
-			ctx.ui.notify(
-				`Rotated to account ${label} (${state.currentIndex + 1}/${state.accounts.length}) - rotation #${state.rotationCount}`,
-				"success"
-			);
-
+			const healthScore = calculateHealthScore(newCredentials, state.quotaState, config);
+			
+			if (!config.quiet_mode) {
+				ctx.ui.notify(
+					`Rotated to account ${label} (${state.currentIndex + 1}/${state.accounts.length}) [health: ${healthScore}] - rotation #${state.rotationCount}`,
+					"success"
+				);
+			}
+			
+			debug(`Successfully rotated to account ${label}, health: ${healthScore}`);
 			return true;
 		} catch (error) {
-			ctx.ui.notify(`Failed to rotate account: ${error}`, "error");
+			debug("Failed to register provider:", error);
+			if (!config.quiet_mode) {
+				ctx.ui.notify(`Failed to rotate account: ${error}`, "error");
+			}
 			// Revert to previous index on failure
 			state.currentIndex = previousIndex;
 			return false;
@@ -434,15 +894,42 @@ export default function (pi: ExtensionAPI) {
 	// Listen for model errors and auto-rotate on rate limits
 	pi.on("model_error", async (event, ctx) => {
 		if (isRateLimitError(event.error)) {
-			ctx.ui.notify("Rate limit detected. Attempting to rotate account...", "warning");
+			const currentAccount = state.accounts[state.currentIndex];
+			const accountId = currentAccount?.id || "unknown";
+			const quota = state.quotaState[accountId] || { requestCount: 0, failureCount: 0 };
+			
+			debug("Rate limit error detected for account:", accountId);
+			
+			// Check if we should wait before rotating (to preserve prompt cache)
+			if (config.rate_limit_wait_enabled && getEnabledAccounts(state.accounts).length > 1) {
+				const waitTime = calculateWaitTime(quota.failureCount, config);
+				
+				// Only wait if it's the first few failures for this account
+				if (quota.failureCount < 3 && waitTime <= config.max_rate_limit_wait_seconds) {
+					if (!config.quiet_mode) {
+						ctx.ui.notify(
+							`Rate limit detected. Waiting ${waitTime}s before rotating (to preserve cache)...`,
+							"warning"
+						);
+					}
+					debug(`Waiting ${waitTime}s before rotating...`);
+					await sleep(waitTime * 1000);
+				}
+			}
+			
+			if (!config.quiet_mode) {
+				ctx.ui.notify("Attempting to rotate account...", "info");
+			}
 
-			const success = await rotateAccount(ctx);
+			const success = await rotateAccount(ctx, true);
 
-			if (!success && state.accounts.length > 0) {
-				ctx.ui.notify(
-					`All ${state.accounts.length} account(s) may be rate limited. Please wait before retrying.`,
-					"error"
-				);
+			if (!success && getEnabledAccounts(state.accounts).length > 0) {
+				if (!config.quiet_mode) {
+					ctx.ui.notify(
+						`All ${getEnabledAccounts(state.accounts).length} enabled account(s) may be rate limited. Please wait before retrying.`,
+						"error"
+					);
+				}
 			}
 		}
 	});
@@ -451,22 +938,124 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "rotate_account",
 		label: "Rotate Account",
-		description: "Manually rotate to the next Google Antigravity account or check rotation status",
+		description: "Manage Google Antigravity account rotation. Actions: rotate (switch account), status (show accounts), enable/disable (toggle account), health (show scores), reset (clear failures)",
 		parameters: RotateAccountParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			debug(`Tool called with action: ${params.action}, accountId: ${params.accountId}`);
+
+			// Handle enable/disable actions
+			if (params.action === "enable" || params.action === "disable") {
+				if (!params.accountId) {
+					return {
+						content: [{ type: "text", text: `Error: accountId required for ${params.action} action` }],
+						details: {
+							action: params.action,
+							state: { ...state },
+							message: "Missing accountId",
+							error: "accountId required",
+						} as RotationDetails,
+						isError: true,
+					};
+				}
+
+				const accountIdx = state.accounts.findIndex(a => a.id === params.accountId);
+				if (accountIdx === -1) {
+					return {
+						content: [{ type: "text", text: `Error: Account ${params.accountId} not found` }],
+						details: {
+							action: params.action,
+							state: { ...state },
+							message: "Account not found",
+							error: `Account ${params.accountId} not found`,
+						} as RotationDetails,
+						isError: true,
+					};
+				}
+
+				const newEnabled = params.action === "enable";
+				state.accounts[accountIdx].enabled = newEnabled;
+				saveCredentials(state.accounts);
+
+				const label = state.accounts[accountIdx].label || `Account ${accountIdx + 1}`;
+				const message = `${label} ${newEnabled ? "enabled" : "disabled"}`;
+				debug(message);
+
+				return {
+					content: [{ type: "text", text: message }],
+					details: {
+						action: params.action,
+						state: { ...state },
+						message,
+					} as RotationDetails,
+				};
+			}
+
+			// Handle health action
+			if (params.action === "health") {
+				const healthInfo = state.accounts.map((acc, i) => {
+					const label = acc.label || `Account ${i + 1}`;
+					const score = calculateHealthScore(acc, state.quotaState, config);
+					const enabled = acc.enabled ? "" : " [DISABLED]";
+					const current = i === state.currentIndex ? " (current)" : "";
+					const quota = state.quotaState[acc.id];
+					
+					let status = `  ${label}${current}${enabled}: ${score}/100`;
+					if (quota) {
+						if (quota.rateLimitUntil && Date.now() < quota.rateLimitUntil) {
+							const waitSec = Math.ceil((quota.rateLimitUntil - Date.now()) / 1000);
+							status += ` [rate limited, ${waitSec}s remaining]`;
+						}
+						status += ` (requests: ${quota.requestCount}, failures: ${quota.failureCount})`;
+					}
+					return status;
+				});
+
+				const message = state.accounts.length === 0
+					? "No accounts configured"
+					: `Health scores:\n${healthInfo.join("\n")}\n\nStrategy: ${config.account_selection_strategy}`;
+
+				return {
+					content: [{ type: "text", text: message }],
+					details: {
+						action: "status",
+						state: { ...state },
+						message,
+					} as RotationDetails,
+				};
+			}
+
+			// Handle reset action
+			if (params.action === "reset") {
+				state.quotaState = {};
+				const message = "All failure counters and rate limit states have been reset";
+				debug(message);
+
+				return {
+					content: [{ type: "text", text: message }],
+					details: {
+						action: "status",
+						state: { ...state },
+						message,
+					} as RotationDetails,
+				};
+			}
+
 			if (params.action === "status") {
 				const accounts = state.accounts.map((acc, i) => {
 					const label = acc.label || `Account ${i + 1}`;
 					const current = i === state.currentIndex ? " (current)" : "";
+					const enabled = acc.enabled ? "" : " [DISABLED]";
 					const expires = new Date(acc.expires).toLocaleString();
-					return `  ${label}${current} - expires: ${expires}`;
+					const health = calculateHealthScore(acc, state.quotaState, config);
+					return `  ${label}${current}${enabled} - health: ${health}/100, expires: ${expires}, id: ${acc.id}`;
 				});
 
+				const enabledCount = getEnabledAccounts(state.accounts).length;
 				const status =
 					state.accounts.length === 0
 						? "No accounts configured"
-						: `${state.accounts.length} account(s) configured:\n${accounts.join("\n")}\n\nRotations performed: ${state.rotationCount}`;
+						: `${state.accounts.length} account(s) configured (${enabledCount} enabled):\n${accounts.join("\n")}\n\nRotations performed: ${state.rotationCount}\nStrategy: ${config.account_selection_strategy}`;
 
 				return {
 					content: [{ type: "text", text: status }],
@@ -479,23 +1068,25 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// Rotate action
-			if (state.accounts.length === 0) {
+			if (getEnabledAccounts(state.accounts).length === 0) {
 				return {
-					content: [{ type: "text", text: "No accounts configured. Use /rotationsetup to add accounts." }],
+					content: [{ type: "text", text: "No enabled accounts. Use /rotationsetup to add accounts." }],
 					details: {
 						action: "rotate",
 						state: { ...state },
 						message: "No accounts",
-						error: "No accounts configured",
+						error: "No enabled accounts",
 					} as RotationDetails,
 				};
 			}
 
-			const success = await rotateAccount(ctx);
+			const success = await rotateAccount(ctx, true);
 
 			if (success) {
-				const label = state.accounts[state.currentIndex].label || `#${state.currentIndex + 1}`;
-				const message = `Rotated to account ${label} (${state.currentIndex + 1}/${state.accounts.length})`;
+				const acc = state.accounts[state.currentIndex];
+				const label = acc.label || `#${state.currentIndex + 1}`;
+				const health = calculateHealthScore(acc, state.quotaState, config);
+				const message = `Rotated to account ${label} (${state.currentIndex + 1}/${state.accounts.length}) [health: ${health}]`;
 				return {
 					content: [{ type: "text", text: message }],
 					details: {
@@ -521,6 +1112,9 @@ export default function (pi: ExtensionAPI) {
 		renderCall(args, theme) {
 			let text = theme.fg("toolTitle", theme.bold("rotate_account "));
 			text += theme.fg("muted", args.action);
+			if (args.accountId) {
+				text += " " + theme.fg("accent", args.accountId);
+			}
 			return new Text(text, 0, 0);
 		},
 
@@ -544,7 +1138,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (expanded && details.state.accounts.length > 0) {
-				text += "\n" + theme.fg("dim", `Accounts: ${details.state.accounts.length}`);
+				const enabledCount = getEnabledAccounts(details.state.accounts).length;
+				text += "\n" + theme.fg("dim", `Accounts: ${details.state.accounts.length} (${enabledCount} enabled)`);
 				text += "\n" + theme.fg("dim", `Current: #${details.state.currentIndex + 1}`);
 				text += "\n" + theme.fg("dim", `Rotations: ${details.state.rotationCount}`);
 			}
@@ -562,17 +1157,116 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			debug("Starting rotation setup");
 			ctx.ui.notify("Starting account rotation setup...", "info");
 
-			// Show current state
+			// Show current state and options
 			if (state.accounts.length > 0) {
-				const proceed = await ctx.ui.confirm(
-					"Existing Configuration",
-					`${state.accounts.length} account(s) already configured. Add more accounts?`
+				const enabledCount = getEnabledAccounts(state.accounts).length;
+				const choice = await ctx.ui.select(
+					`${state.accounts.length} account(s) configured (${enabledCount} enabled). What do you want to do?`,
+					[
+						"Add more accounts",
+						"Manage existing accounts (enable/disable)",
+						"Configure settings",
+						"Clear all and start fresh",
+						"Cancel"
+					]
 				);
-				if (!proceed) {
+
+				if (!choice || choice === "Cancel") {
 					return;
 				}
+
+				if (choice.includes("Manage existing")) {
+					// Show account list for enable/disable
+					const accountChoices = state.accounts.map((acc, i) => {
+						const label = acc.label || `Account ${i + 1}`;
+						const status = acc.enabled ? "[ENABLED]" : "[DISABLED]";
+						const current = i === state.currentIndex ? " (current)" : "";
+						return `${label} ${status}${current}`;
+					});
+					accountChoices.push("Back");
+
+					const selected = await ctx.ui.select("Select account to toggle:", accountChoices);
+					if (selected && selected !== "Back") {
+						const idx = accountChoices.indexOf(selected);
+						if (idx >= 0 && idx < state.accounts.length) {
+							state.accounts[idx].enabled = !state.accounts[idx].enabled;
+							saveCredentials(state.accounts);
+							const newStatus = state.accounts[idx].enabled ? "enabled" : "disabled";
+							ctx.ui.notify(`Account ${state.accounts[idx].label || idx + 1} ${newStatus}`, "success");
+						}
+					}
+					return;
+				}
+
+				if (choice.includes("Configure settings")) {
+					// Show settings menu
+					const strategies: SelectionStrategy[] = ["sticky", "round-robin", "hybrid"];
+					const currentStrategy = config.account_selection_strategy;
+					
+					const strategyChoice = await ctx.ui.select(
+						`Current strategy: ${currentStrategy}. Select new strategy:`,
+						[
+							`sticky - Stay on same account until rate limited${currentStrategy === "sticky" ? " (current)" : ""}`,
+							`round-robin - Rotate on every request${currentStrategy === "round-robin" ? " (current)" : ""}`,
+							`hybrid - Use health scores to select best account${currentStrategy === "hybrid" ? " (current)" : ""}`,
+							"Back"
+						]
+					);
+
+					if (strategyChoice && strategyChoice !== "Back") {
+						const newStrategy = strategyChoice.split(" - ")[0] as SelectionStrategy;
+						config.account_selection_strategy = newStrategy;
+						saveConfig(config);
+						ctx.ui.notify(`Strategy changed to: ${newStrategy}`, "success");
+						debug("Strategy changed to:", newStrategy);
+					}
+
+					// Toggle debug
+					const debugChoice = await ctx.ui.confirm(
+						"Debug Logging",
+						`Debug logging is currently ${config.debug ? "ENABLED" : "DISABLED"}. Toggle?`
+					);
+					if (debugChoice) {
+						config.debug = !config.debug;
+						debugEnabled = config.debug;
+						saveConfig(config);
+						ctx.ui.notify(`Debug logging ${config.debug ? "enabled" : "disabled"}`, "info");
+					}
+
+					// Toggle PID offset
+					const pidChoice = await ctx.ui.confirm(
+						"PID Offset",
+						`PID offset is ${config.pid_offset_enabled ? "ENABLED" : "DISABLED"} (for parallel sessions). Toggle?`
+					);
+					if (pidChoice) {
+						config.pid_offset_enabled = !config.pid_offset_enabled;
+						saveConfig(config);
+						ctx.ui.notify(`PID offset ${config.pid_offset_enabled ? "enabled" : "disabled"}`, "info");
+					}
+
+					return;
+				}
+
+				if (choice.includes("Clear all")) {
+					const confirm = await ctx.ui.confirm(
+						"Clear All Accounts",
+						`This will delete all ${state.accounts.length} account(s). Are you sure?`
+					);
+					if (confirm) {
+						state.accounts = [];
+						state.currentIndex = 0;
+						state.rotationCount = 0;
+						state.quotaState = {};
+						saveCredentials(state.accounts);
+						ctx.ui.notify("All accounts cleared.", "success");
+					}
+					return;
+				}
+
+				// If "Add more accounts", continue below
 			}
 
 			// Check if OAuth is configured
@@ -607,6 +1301,7 @@ export default function (pi: ExtensionAPI) {
 				if (method.includes("OAuth") && hasOAuthConfig) {
 					// OAuth flow
 					try {
+						debug("Starting OAuth flow");
 						ctx.ui.notify("Starting OAuth flow...", "info");
 
 						const stateParam = generateAccountId();
@@ -638,6 +1333,7 @@ export default function (pi: ExtensionAPI) {
 							// Exchange code for tokens
 							ctx.ui.notify("Exchanging code for tokens...", "info");
 							credentials = await exchangeCodeForTokens(code);
+							debug("OAuth tokens obtained successfully");
 						} else {
 							// Manual fallback
 							const callbackUrl = await ctx.ui.input(
@@ -671,11 +1367,14 @@ export default function (pi: ExtensionAPI) {
 							...credentials,
 							label: label || undefined,
 							addedAt: Date.now(),
+							enabled: true,
 						};
 
 						newAccounts.push(account);
 						ctx.ui.notify(`Account ${newAccounts.length} added successfully via OAuth!`, "success");
+						debug("Account added via OAuth:", account.id);
 					} catch (error) {
+						debug("OAuth failed:", error);
 						ctx.ui.notify(`OAuth failed: ${error}`, "error");
 						const retry = await ctx.ui.confirm("OAuth Error", "Try adding this account again?");
 						if (!retry) {
@@ -718,10 +1417,12 @@ export default function (pi: ExtensionAPI) {
 						...credentials,
 						label: label || undefined,
 						addedAt: Date.now(),
+						enabled: true,
 					};
 
 					newAccounts.push(account);
 					ctx.ui.notify(`Account ${newAccounts.length} added successfully!`, "success");
+					debug("Account added manually:", account.id);
 				}
 
 				const addMore = await ctx.ui.confirm(
@@ -741,8 +1442,9 @@ export default function (pi: ExtensionAPI) {
 
 			// Update state and save to file
 			state.accounts = newAccounts;
-			state.currentIndex = 0;
+			state.currentIndex = getInitialAccountIndex(newAccounts, config);
 			saveCredentials(state.accounts);
+			debug("Setup complete, saved", newAccounts.length, "accounts");
 
 			// Persist to session
 			pi.sendMessage(
@@ -759,10 +1461,11 @@ export default function (pi: ExtensionAPI) {
 				{ triggerTurn: false }
 			);
 
-			// Apply the first account
-			if (state.accounts.length > 0) {
+			// Apply the first enabled account
+			const enabledAccounts = getEnabledAccounts(state.accounts);
+			if (enabledAccounts.length > 0) {
 				try {
-					const firstAccount = state.accounts[0];
+					const firstAccount = state.accounts[state.currentIndex];
 					pi.registerProvider("google-antigravity", {
 						oauth: {
 							name: "Google Antigravity (Multi-Account)",
@@ -780,10 +1483,11 @@ export default function (pi: ExtensionAPI) {
 
 					const label = firstAccount.label || "Account 1";
 					ctx.ui.notify(
-						`Setup complete! ${state.accounts.length} account(s) configured. Currently using ${label}.`,
+						`Setup complete! ${state.accounts.length} account(s) configured. Currently using ${label}. Strategy: ${config.account_selection_strategy}`,
 						"success"
 					);
 				} catch (error) {
+					debug("Failed to activate account:", error);
 					ctx.ui.notify(`Setup complete but failed to activate account: ${error}`, "warning");
 				}
 			}
@@ -801,13 +1505,84 @@ export default function (pi: ExtensionAPI) {
 		text += theme.fg("success", details.message);
 
 		if (details.state.accounts.length > 0) {
-			text += "\n" + theme.fg("dim", `  • ${details.state.accounts.length} account(s) configured`);
+			const enabledCount = getEnabledAccounts(details.state.accounts).length;
+			text += "\n" + theme.fg("dim", `  • ${details.state.accounts.length} account(s) (${enabledCount} enabled)`);
 			const currentLabel =
 				details.state.accounts[details.state.currentIndex]?.label || `Account ${details.state.currentIndex + 1}`;
 			text += "\n" + theme.fg("dim", `  • Active: ${currentLabel}`);
 		}
 
 		return new Text(text, 0, 0);
+	});
+
+	// Register /rotationstatus command for quick status check
+	pi.registerCommand("rotationstatus", {
+		description: "Show current account rotation status and health",
+		handler: async (_args, ctx) => {
+			const enabledCount = getEnabledAccounts(state.accounts).length;
+			
+			if (state.accounts.length === 0) {
+				ctx.ui.notify("No accounts configured. Use /rotationsetup to add accounts.", "warning");
+				return;
+			}
+
+			let statusText = `Account Rotation Status\n`;
+			statusText += `${"─".repeat(40)}\n`;
+			statusText += `Strategy: ${config.account_selection_strategy}\n`;
+			statusText += `Accounts: ${state.accounts.length} (${enabledCount} enabled)\n`;
+			statusText += `Rotations: ${state.rotationCount}\n\n`;
+
+			for (let i = 0; i < state.accounts.length; i++) {
+				const acc = state.accounts[i];
+				const label = acc.label || `Account ${i + 1}`;
+				const current = i === state.currentIndex ? " [ACTIVE]" : "";
+				const enabled = acc.enabled ? "" : " [DISABLED]";
+				const health = calculateHealthScore(acc, state.quotaState, config);
+				const quota = state.quotaState[acc.id];
+
+				statusText += `#${i + 1} ${label}${current}${enabled}\n`;
+				statusText += `    Health: ${health}/100\n`;
+				
+				if (quota) {
+					statusText += `    Requests: ${quota.requestCount || 0}\n`;
+					statusText += `    Failures: ${quota.failureCount || 0}\n`;
+					if (quota.rateLimitUntil && Date.now() < quota.rateLimitUntil) {
+						const waitSec = Math.ceil((quota.rateLimitUntil - Date.now()) / 1000);
+						statusText += `    Rate limited: ${waitSec}s remaining\n`;
+					}
+				}
+				statusText += `\n`;
+			}
+
+			ctx.ui.notify(statusText, "info");
+		},
+	});
+
+	// Register /rotationconfig command
+	pi.registerCommand("rotationconfig", {
+		description: "Show or edit rotation configuration",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) {
+				ctx.ui.notify(JSON.stringify(config, null, 2), "info");
+				return;
+			}
+
+			const configText = `Current Configuration:
+─────────────────────────────────
+Strategy: ${config.account_selection_strategy}
+PID Offset: ${config.pid_offset_enabled}
+Max Rate Limit Wait: ${config.max_rate_limit_wait_seconds}s
+Rate Limit Wait Enabled: ${config.rate_limit_wait_enabled}
+Initial Wait Time: ${config.rate_limit_initial_wait_seconds}s
+Soft Quota Threshold: ${config.soft_quota_threshold_percent}%
+Failure TTL: ${config.failure_ttl_seconds}s
+Debug: ${config.debug}
+Quiet Mode: ${config.quiet_mode}
+─────────────────────────────────
+Config file: ${CONFIG_FILE}`;
+
+			ctx.ui.notify(configText, "info");
+		},
 	});
 
 	// Initialize on load

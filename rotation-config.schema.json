@@ -1,0 +1,67 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Account Rotation Configuration",
+  "description": "Configuration for pi-antigravity-multiaccount extension v1.2.0",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference"
+    },
+    "account_selection_strategy": {
+      "type": "string",
+      "enum": ["sticky", "round-robin", "hybrid"],
+      "default": "hybrid",
+      "description": "Strategy for selecting accounts. 'sticky' stays on same account until rate limited, 'round-robin' rotates every request, 'hybrid' uses health scores"
+    },
+    "pid_offset_enabled": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable PID-based offset for initial account selection (useful for parallel sessions)"
+    },
+    "max_rate_limit_wait_seconds": {
+      "type": "number",
+      "default": 60,
+      "minimum": 0,
+      "maximum": 3600,
+      "description": "Maximum seconds to wait for rate limit before switching accounts"
+    },
+    "failure_ttl_seconds": {
+      "type": "number",
+      "default": 3600,
+      "minimum": 60,
+      "maximum": 86400,
+      "description": "Time in seconds after which failure counts are reset"
+    },
+    "rate_limit_wait_enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable waiting before rotating to preserve prompt cache (v1.2.0)"
+    },
+    "rate_limit_initial_wait_seconds": {
+      "type": "number",
+      "default": 5,
+      "minimum": 1,
+      "maximum": 60,
+      "description": "Initial wait time for exponential backoff in seconds (v1.2.0)"
+    },
+    "soft_quota_threshold_percent": {
+      "type": "number",
+      "default": 90,
+      "minimum": 50,
+      "maximum": 100,
+      "description": "Skip accounts with failure rate >= this percentage (v1.2.0)"
+    },
+    "debug": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable debug logging to console"
+    },
+    "quiet_mode": {
+      "type": "boolean",
+      "default": false,
+      "description": "Suppress toast notifications"
+    }
+  },
+  "additionalProperties": false
+}
