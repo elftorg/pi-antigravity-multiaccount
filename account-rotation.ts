@@ -20,7 +20,7 @@
  * - Soft quota threshold
  * - Health scoring system
  * 
- * @version 1.2.0
+ * @version 1.2.1
  */
 
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -103,6 +103,9 @@ const RotateAccountParams = Type.Object({
 const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
 const CREDENTIALS_FILE = join(PI_AGENT_DIR, "rotation-credentials.json");
 const CONFIG_FILE = join(PI_AGENT_DIR, "rotation-config.json");
+
+// Maximum recursion depth for rotateAccount to prevent infinite loops
+const MAX_ROTATION_DEPTH = 5;
 
 const DEFAULT_CONFIG: RotationConfig = {
 	account_selection_strategy: "hybrid",
@@ -218,6 +221,8 @@ function saveCredentials(accounts: AccountCredentials[]): void {
 			mkdirSync(dir, { recursive: true });
 		}
 		writeFileSync(CREDENTIALS_FILE, JSON.stringify(accounts, null, 2), { mode: 0o600 });
+		// Invalidate cache since accounts may have changed
+		invalidateEnabledAccountsCache();
 		debug(`Saved ${accounts.length} account(s) to credentials file`);
 	} catch (error) {
 		console.error("Failed to save credentials:", error);
@@ -460,10 +465,50 @@ function generateAccountId(): string {
 // ============================================================================
 
 /**
- * Get enabled accounts only
+ * Get enabled accounts only (with simple caching)
+ * Cache is invalidated when accounts array reference changes
  */
+let _enabledAccountsCache: { accounts: AccountCredentials[], result: AccountCredentials[] } | null = null;
+
 function getEnabledAccounts(accounts: AccountCredentials[]): AccountCredentials[] {
-	return accounts.filter(acc => acc.enabled);
+	// Simple cache: if same accounts array reference, return cached result
+	if (_enabledAccountsCache && _enabledAccountsCache.accounts === accounts) {
+		return _enabledAccountsCache.result;
+	}
+	
+	const result = accounts.filter(acc => acc.enabled);
+	_enabledAccountsCache = { accounts, result };
+	return result;
+}
+
+/**
+ * Invalidate enabled accounts cache (call when accounts are modified)
+ */
+function invalidateEnabledAccountsCache(): void {
+	_enabledAccountsCache = null;
+}
+
+/**
+ * Clean up expired failures based on TTL
+ * This resets failure counts for accounts whose last failure was longer ago than failure_ttl_seconds
+ */
+function cleanupExpiredFailures(
+	quotaState: Record<string, AccountQuotaState>,
+	config: RotationConfig
+): void {
+	const now = Date.now();
+	const ttlMs = config.failure_ttl_seconds * 1000;
+	
+	for (const accountId of Object.keys(quotaState)) {
+		const quota = quotaState[accountId];
+		if (quota.failureCount > 0 && quota.lastRateLimitAt) {
+			if (now - quota.lastRateLimitAt > ttlMs) {
+				debug(`Resetting expired failures for account ${accountId} (TTL: ${config.failure_ttl_seconds}s)`);
+				quota.failureCount = 0;
+				quota.rateLimitUntil = undefined;
+			}
+		}
+	}
 }
 
 /**
@@ -762,8 +807,23 @@ export default function (pi: ExtensionAPI) {
 
 	/**
 	 * Switch to the next available account
+	 * @param ctx Extension context
+	 * @param forceRotate Force rotation even if current account is healthy
+	 * @param depth Recursion depth to prevent infinite loops (max: MAX_ROTATION_DEPTH)
 	 */
-	const rotateAccount = async (ctx: ExtensionContext, forceRotate: boolean = true): Promise<boolean> => {
+	const rotateAccount = async (ctx: ExtensionContext, forceRotate: boolean = true, depth: number = 0): Promise<boolean> => {
+		// Prevent infinite recursion
+		if (depth >= MAX_ROTATION_DEPTH) {
+			debug(`Max rotation depth (${MAX_ROTATION_DEPTH}) reached, stopping recursion`);
+			if (!config.quiet_mode) {
+				ctx.ui.notify("Max rotation attempts reached. All accounts may have issues.", "error");
+			}
+			return false;
+		}
+
+		// Clean up expired failures before selecting
+		cleanupExpiredFailures(state.quotaState, config);
+
 		const enabledAccounts = getEnabledAccounts(state.accounts);
 		
 		if (enabledAccounts.length === 0) {
@@ -838,9 +898,9 @@ export default function (pi: ExtensionAPI) {
 				if (!config.quiet_mode) {
 					ctx.ui.notify(`Failed to refresh token: ${error}`, "error");
 				}
-				// Record failure and try next account
+				// Record failure and try next account (with incremented depth)
 				recordRateLimit(newCredentials.id);
-				return rotateAccount(ctx, true);
+				return rotateAccount(ctx, true, depth + 1);
 			}
 		}
 
@@ -864,6 +924,9 @@ export default function (pi: ExtensionAPI) {
 
 			const label = newCredentials.label || `#${state.currentIndex + 1}`;
 			const healthScore = calculateHealthScore(newCredentials, state.quotaState, config);
+			
+			// Record successful rotation for the new account
+			recordSuccess(newCredentials.id);
 			
 			if (!config.quiet_mode) {
 				ctx.ui.notify(

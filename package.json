@@ -1,6 +1,6 @@
 {
   "name": "pi-extension-antigravity-rotation",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Automatic account rotation for google-antigravity provider in pi-coding-agent with multiple selection strategies, health scoring, and smart rate limit handling",
   "type": "module",
   "keywords": [
